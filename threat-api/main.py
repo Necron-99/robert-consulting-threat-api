@@ -455,6 +455,13 @@ def list_groups(
         tuple(params) + (page_size, offset)
     )
 
+    for g in results:
+        if g.get("target_sectors"):
+            try:
+                g["target_sectors"] = json.loads(g["target_sectors"])
+            except (ValueError, TypeError):
+                pass
+
     return {
         "total": total,
         "page": page,
