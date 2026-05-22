@@ -14,6 +14,8 @@ Endpoints:
     GET /tactics                         — list all ATT&CK tactics
     GET /tactics/{tactic_id}             — tactic detail with techniques
 
+    GET /heatmap/data                    — tactics + techniques + counts for heatmap UI
+
     GET /techniques                      — list techniques (paginated, filterable)
     GET /techniques/{technique_id}       — technique detail
     GET /techniques/{technique_id}/groups  — groups using this technique
@@ -212,7 +214,66 @@ def stats_by_country():
 
 @app.get("/tactics", tags=["tactics"])
 def list_tactics():
-    return query("SELECT * FROM tactics ORDER BY tactic_id")
+    return query("""
+        SELECT t.tactic_id, t.name, t.description, t.url,
+               COUNT(DISTINCT tt.technique_id) as technique_count
+        FROM tactics t
+        LEFT JOIN technique_tactics tt ON t.tactic_id = tt.tactic_id
+        LEFT JOIN techniques tech ON tt.technique_id = tech.technique_id
+            AND tech.is_deprecated = 0 AND tech.is_revoked = 0
+        GROUP BY t.tactic_id
+        ORDER BY t.tactic_id
+    """)
+
+
+@app.get("/heatmap/data", tags=["heatmap"])
+def heatmap_data():
+    """
+    Returns all data needed to render the ATT&CK Navigator-style heatmap
+    in a single request. Includes every non-deprecated base technique and
+    sub-technique with tactic assignments, group usage count, and KEV count.
+    """
+    tactics = query(
+        "SELECT tactic_id, name FROM tactics ORDER BY tactic_id"
+    )
+
+    techniques = query("""
+        SELECT
+            t.technique_id,
+            t.name,
+            t.is_subtechnique,
+            t.parent_technique_id,
+            t.platforms,
+            COUNT(DISTINCT gt.group_id)  AS group_count,
+            COUNT(DISTINCT ktm.cve_id)   AS kev_count
+        FROM techniques t
+        LEFT JOIN group_techniques gt  ON t.technique_id = gt.technique_id
+        LEFT JOIN kev_technique_mappings ktm ON t.technique_id = ktm.technique_id
+        WHERE t.is_deprecated = 0 AND t.is_revoked = 0
+        GROUP BY t.technique_id
+        ORDER BY t.technique_id
+    """)
+
+    assignments = query("""
+        SELECT tt.tactic_id, tt.technique_id
+        FROM technique_tactics tt
+        JOIN techniques t ON tt.technique_id = t.technique_id
+        WHERE t.is_deprecated = 0 AND t.is_revoked = 0
+    """)
+
+    tactic_map = {t["tactic_id"]: [] for t in tactics}
+    for a in assignments:
+        if a["tactic_id"] in tactic_map:
+            tactic_map[a["tactic_id"]].append(a["technique_id"])
+
+    for tactic in tactics:
+        tactic["technique_count"] = len(tactic_map[tactic["tactic_id"]])
+
+    return {
+        "tactics": tactics,
+        "techniques": techniques,
+        "tactic_techniques": tactic_map,
+    }
 
 
 @app.get("/tactics/{tactic_id}", tags=["tactics"])
