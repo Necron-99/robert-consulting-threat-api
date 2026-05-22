@@ -31,6 +31,11 @@ RUN groupadd -r appuser && useradd -r -g appuser appuser
 WORKDIR /app
 
 COPY --from=builder /build/venv /app/venv
+
+# Rewrite shebangs from builder path to runtime path
+RUN find /app/venv/bin -type f | xargs grep -l "#!/build/venv" 2>/dev/null | \
+    xargs sed -i 's|#!/build/venv|#!/app/venv|g'
+
 ENV PATH="/app/venv/bin:$PATH"
 
 COPY main.py .
