@@ -20,9 +20,12 @@ Endpoints:
     GET /techniques/{technique_id}/software — software implementing this technique
     GET /techniques/{technique_id}/compliance — compliance controls (via compliance API)
 
-    GET /groups                          — list threat actor groups
+    GET /groups                          — list threat actor groups (filterable by metadata)
     GET /groups/{group_id}               — group detail with techniques used
     GET /groups/{group_id}/techniques    — techniques used by this group
+    GET /groups/{group_id}/software      — software used by this group
+
+    GET /stats/by-country                — group and technique counts by country
 
     GET /software                        — list malware and tools
     GET /software/{software_id}          — software detail with techniques
@@ -34,6 +37,7 @@ Endpoints:
     GET /search                          — search across techniques, groups, software
 """
 
+import json
 import os
 import sqlite3
 import logging
@@ -184,6 +188,23 @@ def stats():
         }
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/stats/by-country", tags=["system"])
+def stats_by_country():
+    """Group and technique counts broken down by attributed country."""
+    rows = query("""
+        SELECT gm.country, gm.country_name, gm.sponsor_type,
+               COUNT(DISTINCT g.group_id) as group_count,
+               COUNT(DISTINCT gt.technique_id) as technique_count
+        FROM group_metadata gm
+        JOIN groups g ON gm.group_id = g.group_id
+        LEFT JOIN group_techniques gt ON g.group_id = gt.group_id
+        WHERE gm.country IS NOT NULL AND gm.country != 'ZZ'
+        GROUP BY gm.country, gm.country_name, gm.sponsor_type
+        ORDER BY group_count DESC
+    """)
+    return {"by_country": rows}
 
 # =============================================================================
 # Tactics
@@ -398,15 +419,42 @@ async def get_technique_compliance(technique_id: str):
 
 @app.get("/groups", tags=["groups"])
 def list_groups(
+    country: Optional[str] = Query(default=None, description="ISO 3166-1 alpha-2 e.g. RU, CN"),
+    motivation: Optional[str] = Query(default=None, description="espionage, financial, destruction, hacktivism"),
+    sponsor_type: Optional[str] = Query(default=None, description="nation-state, criminal, hacktivist, unknown"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=100, ge=1, le=500),
 ):
-    total = query_one("SELECT COUNT(*) as n FROM groups")["n"]
+    joins = "LEFT JOIN group_metadata gm ON g.group_id = gm.group_id"
+    where = []
+    params = []
+
+    if country:
+        where.append("gm.country = ?")
+        params.append(country.upper())
+    if motivation:
+        where.append("gm.motivation = ?")
+        params.append(motivation.lower())
+    if sponsor_type:
+        where.append("gm.sponsor_type = ?")
+        params.append(sponsor_type.lower())
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    total = query_one(
+        f"SELECT COUNT(*) as n FROM groups g {joins} {where_sql}", tuple(params)
+    )["n"]
+
     offset = (page - 1) * page_size
     results = query(
-        "SELECT group_id, name, aliases FROM groups ORDER BY name LIMIT ? OFFSET ?",
-        (page_size, offset)
+        f"""SELECT g.group_id, g.name, g.aliases,
+                   gm.country, gm.country_name, gm.motivation,
+                   gm.sponsor_type, gm.first_seen, gm.target_sectors
+            FROM groups g {joins} {where_sql}
+            ORDER BY g.name LIMIT ? OFFSET ?""",
+        tuple(params) + (page_size, offset)
     )
+
     return {
         "total": total,
         "page": page,
@@ -448,8 +496,19 @@ def get_group(group_id: str):
         tuple(tactic_ids)
     ) if tactic_ids else []
 
+    metadata = query_one(
+        "SELECT * FROM group_metadata WHERE group_id = ?", (group_id.upper(),)
+    )
+
+    if metadata and metadata.get("target_sectors"):
+        try:
+            metadata["target_sectors"] = json.loads(metadata["target_sectors"])
+        except (ValueError, TypeError):
+            pass
+
     return {
         **group,
+        "metadata": metadata or {},
         "technique_count": len(techniques),
         "techniques": techniques,
         "tactics_observed": tactics,
@@ -473,6 +532,24 @@ def get_group_techniques(group_id: str):
     """, (group_id.upper(),))
 
     return {**group, "technique_count": len(techniques), "techniques": techniques}
+
+
+@app.get("/groups/{group_id}/software", tags=["groups"])
+def get_group_software(group_id: str):
+    group = query_one("SELECT group_id, name FROM groups WHERE group_id = ?",
+                      (group_id.upper(),))
+    if not group:
+        raise HTTPException(status_code=404, detail=f"Group '{group_id}' not found")
+
+    software = query("""
+        SELECT s.software_id, s.name, s.software_type, s.aliases, s.platforms
+        FROM software s
+        JOIN group_software gs ON s.software_id = gs.software_id
+        WHERE gs.group_id = ?
+        ORDER BY s.name
+    """, (group_id.upper(),))
+
+    return {**group, "software_count": len(software), "software": software}
 
 # =============================================================================
 # Software
