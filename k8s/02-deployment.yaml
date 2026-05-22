@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: threat-api
+  namespace: threat-api
+  labels:
+    app: threat-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: threat-api
+  template:
+    metadata:
+      labels:
+        app: threat-api
+    spec:
+      initContainers:
+        - name: fetch-database
+          image: amazon/aws-cli:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "Fetching threat.db from S3..."
+              aws s3 cp s3://robert-consulting-threat/data/threat.db /data/threat.db
+              ls -lh /data/threat.db || echo "Database fetch failed"
+              echo "SQLite check: $(sqlite3 /data/threat.db 'SELECT COUNT(*) FROM techniques;' 2>/dev/null || echo 'check failed')"
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: threat-api-aws-credentials
+                  key: aws-access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: threat-api-aws-credentials
+                  key: aws-secret-access-key
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+          volumeMounts:
+            - name: data
+              mountPath: /data
+
+      containers:
+        - name: threat-api
+          image: ghcr.io/necron-99/threat-api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_PATH
+              value: /data/threat.db
+            - name: COMPLIANCE_API_URL
+              value: https://api.compliance.robertconsulting.net
+            - name: CORS_ORIGINS
+              value: "https://threat.robertconsulting.net,https://robertconsulting.net"
+            - name: LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 50m
+            limits:
+              memory: 256Mi
+              cpu: 200m
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+      volumes:
+        - name: data
+          emptyDir: {}
