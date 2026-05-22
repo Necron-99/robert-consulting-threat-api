@@ -7,16 +7,16 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: compliance-api
-  namespace: compliance-api
+  name: threat-api
+  namespace: threat-api
   labels:
-    app: compliance-api
-    app.kubernetes.io/name: compliance-api
-    app.kubernetes.io/part-of: compliance-api
+    app: threat-api
+    app.kubernetes.io/name: threat-api
+    app.kubernetes.io/part-of: threat-api
 spec:
   type: ClusterIP
   selector:
-    app: compliance-api
+    app: threat-api
   ports:
     - name: http
       port: 80

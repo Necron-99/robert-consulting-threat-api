@@ -52,6 +52,9 @@ spec:
                 secretKeyRef:
                   name: aws-threat-api-credentials
                   key: S3_KEY
+          volumeMounts:
+            - name: data
+              mountPath: /data
 
       containers:
         - name: threat-api
