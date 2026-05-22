@@ -30,18 +30,28 @@ spec:
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
-                  name: threat-api-aws-credentials
-                  key: aws-access-key-id
+                  name: aws-threat-api-credentials
+                  key: AWS_ACCESS_KEY_ID
             - name: AWS_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
-                  name: threat-api-aws-credentials
-                  key: aws-secret-access-key
+                  name: aws-threat-api-credentials
+                  key: AWS_SECRET_ACCESS_KEY
             - name: AWS_DEFAULT_REGION
-              value: us-east-1
-          volumeMounts:
-            - name: data
-              mountPath: /data
+              valueFrom:
+                secretKeyRef:
+                  name: aws-threat-api-credentials
+                  key: AWS_DEFAULT_REGION
+            - name: S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: aws-threat-api-credentials
+                  key: S3_BUCKET
+            - name: S3_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-threat-api-credentials
+                  key: S3_KEY
 
       containers:
         - name: threat-api
