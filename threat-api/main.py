@@ -47,6 +47,7 @@ import httpx
 from contextlib import asynccontextmanager
 from typing import Optional
 
+from prometheus_fastapi_instrumentator import Instrumentator
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -139,6 +140,8 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+Instrumentator().instrument(app).expose(app)
 
 # =============================================================================
 # Health & Stats
