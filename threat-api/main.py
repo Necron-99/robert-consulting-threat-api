@@ -218,7 +218,7 @@ def stats_by_country():
 @app.get("/tactics", tags=["tactics"])
 def list_tactics():
     return query("""
-        SELECT t.tactic_id, t.name, t.description, t.url,
+        SELECT t.tactic_id, t.name, t.description, t.url, t.plain_english,
                COUNT(DISTINCT tt.technique_id) as technique_count
         FROM tactics t
         LEFT JOIN technique_tactics tt ON t.tactic_id = tt.tactic_id
@@ -638,7 +638,7 @@ def list_software(
     total = query_one(f"SELECT COUNT(*) as n FROM software {where}", params)["n"]
     offset = (page - 1) * page_size
     results = query(
-        f"SELECT software_id, name, software_type, aliases, platforms "
+        f"SELECT software_id, name, software_type, aliases, platforms, plain_english "
         f"FROM software {where} ORDER BY name LIMIT ? OFFSET ?",
         params + (page_size, offset)
     )
