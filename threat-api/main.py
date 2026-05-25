@@ -237,7 +237,7 @@ def heatmap_data():
     sub-technique with tactic assignments, group usage count, and KEV count.
     """
     tactics = query(
-        "SELECT tactic_id, name FROM tactics ORDER BY tactic_id"
+        "SELECT tactic_id, name, plain_english FROM tactics ORDER BY tactic_id"
     )
 
     techniques = query("""
