@@ -1074,6 +1074,82 @@ async def risk_gap(
     }
 
 
+@app.get("/vendor-exposure", tags=["threat-profile"])
+def vendor_exposure(
+    sectors: Optional[str] = Query(default=None, description="Comma-separated sectors — filters to groups targeting those sectors"),
+    limit: int = Query(default=20, ge=1, le=50),
+):
+    """
+    Returns vendors ranked by CVE count in the CISA KEV catalog, cross-referenced
+    with ATT&CK technique mappings and (optionally) threat groups targeting
+    specified sectors. Highlights ransomware-associated CVE concentration.
+
+    Useful for patch prioritization: vendors with high ransomware_count relative
+    to cve_count represent disproportionate ransomware risk.
+    """
+    if sectors:
+        sector_list = [s.strip() for s in sectors.split(",") if s.strip()]
+        sector_conditions = " OR ".join(["gm.target_sectors LIKE ?"] * len(sector_list))
+        sector_params = tuple(f"%{s}%" for s in sector_list)
+
+        rows = query(f"""
+            SELECT k.vendor_project,
+                   COUNT(DISTINCT k.cve_id) as cve_count,
+                   COUNT(DISTINCT ktm.technique_id) as technique_count,
+                   COUNT(DISTINCT gt.group_id) as group_count,
+                   SUM(CASE WHEN k.known_ransomware = 'Known' THEN 1 ELSE 0 END) as ransomware_count
+            FROM kev_entries k
+            JOIN kev_technique_mappings ktm ON k.cve_id = ktm.cve_id
+            JOIN group_techniques gt ON ktm.technique_id = gt.technique_id
+            JOIN group_metadata gm ON gt.group_id = gm.group_id
+            WHERE k.vendor_project IS NOT NULL
+              AND ({sector_conditions})
+            GROUP BY k.vendor_project
+            ORDER BY cve_count DESC
+            LIMIT ?
+        """, sector_params + (limit,))
+    else:
+        rows = query("""
+            SELECT k.vendor_project,
+                   COUNT(DISTINCT k.cve_id) as cve_count,
+                   COUNT(DISTINCT ktm.technique_id) as technique_count,
+                   NULL as group_count,
+                   SUM(CASE WHEN k.known_ransomware = 'Known' THEN 1 ELSE 0 END) as ransomware_count
+            FROM kev_entries k
+            JOIN kev_technique_mappings ktm ON k.cve_id = ktm.cve_id
+            WHERE k.vendor_project IS NOT NULL
+            GROUP BY k.vendor_project
+            ORDER BY cve_count DESC
+            LIMIT ?
+        """, (limit,))
+
+    # Add ransomware risk ratio
+    for r in rows:
+        r["ransomware_ratio"] = round(
+            r["ransomware_count"] / r["cve_count"], 2
+        ) if r["cve_count"] > 0 else 0
+
+    # Summary
+    total_cves = sum(r["cve_count"] for r in rows)
+    total_ransomware = sum(r["ransomware_count"] for r in rows)
+
+    return {
+        "sectors": sectors.split(",") if sectors else None,
+        "summary": {
+            "vendor_count": len(rows),
+            "total_cves": total_cves,
+            "total_ransomware_cves": total_ransomware,
+            "top_vendor": rows[0]["vendor_project"] if rows else None,
+            "highest_ransomware_ratio": max(
+                (r for r in rows if r["cve_count"] >= 5),
+                key=lambda x: x["ransomware_ratio"],
+                default=None
+            )
+        },
+        "vendors": rows,
+    }
+
+
 @app.get("/search", tags=["search"])
 def search(
     q: str = Query(..., min_length=2),
