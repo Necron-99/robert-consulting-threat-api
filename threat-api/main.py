@@ -1097,7 +1097,7 @@ def vendor_exposure(
                    COUNT(DISTINCT k.cve_id) as cve_count,
                    COUNT(DISTINCT ktm.technique_id) as technique_count,
                    COUNT(DISTINCT gt.group_id) as group_count,
-                   SUM(CASE WHEN k.known_ransomware = 'Known' THEN 1 ELSE 0 END) as ransomware_count
+                   COUNT(DISTINCT CASE WHEN k.known_ransomware = 'Known' THEN k.cve_id END) as ransomware_count
             FROM kev_entries k
             JOIN kev_technique_mappings ktm ON k.cve_id = ktm.cve_id
             JOIN group_techniques gt ON ktm.technique_id = gt.technique_id
@@ -1114,7 +1114,7 @@ def vendor_exposure(
                    COUNT(DISTINCT k.cve_id) as cve_count,
                    COUNT(DISTINCT ktm.technique_id) as technique_count,
                    NULL as group_count,
-                   SUM(CASE WHEN k.known_ransomware = 'Known' THEN 1 ELSE 0 END) as ransomware_count
+                   COUNT(DISTINCT CASE WHEN k.known_ransomware = 'Known' THEN k.cve_id END) as ransomware_count
             FROM kev_entries k
             JOIN kev_technique_mappings ktm ON k.cve_id = ktm.cve_id
             WHERE k.vendor_project IS NOT NULL
