@@ -799,7 +799,7 @@ def threat_profile(
         SELECT g.group_id, g.name, g.aliases,
                gm.country, gm.country_name, gm.motivation,
                gm.sponsor_type, gm.first_seen, gm.target_sectors,
-               gm.threat_narrative,
+               g.threat_narrative,
                (SELECT COUNT(*) FROM group_techniques gt
                 WHERE gt.group_id = g.group_id) as technique_count
         FROM groups g
