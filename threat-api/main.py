@@ -774,6 +774,141 @@ def get_kev_entry(cve_id: str):
 # Search
 # =============================================================================
 
+@app.get("/threat-profile", tags=["threat-profile"])
+def threat_profile(
+    sectors: str = Query(..., description="Comma-separated sectors e.g. Healthcare,Government"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, ge=1, le=50),
+    top_techniques: int = Query(default=5, ge=1, le=20),
+):
+    """
+    Returns a threat profile for organizations in the specified sectors.
+    Includes matching threat groups sorted by technique count, top techniques
+    per group with KEV exposure, aggregate top techniques, and KEV summary.
+    """
+    sector_list = [s.strip() for s in sectors.split(",") if s.strip()]
+    if not sector_list:
+        raise HTTPException(status_code=400, detail="At least one sector required")
+
+    # Build sector filter
+    sector_conditions = " OR ".join(["gm.target_sectors LIKE ?"] * len(sector_list))
+    sector_params = tuple(f"%{s}%" for s in sector_list)
+
+    # Get matching group IDs with technique counts
+    all_groups = query(f"""
+        SELECT g.group_id, g.name, g.aliases,
+               gm.country, gm.country_name, gm.motivation,
+               gm.sponsor_type, gm.first_seen, gm.target_sectors,
+               gm.threat_narrative,
+               (SELECT COUNT(*) FROM group_techniques gt
+                WHERE gt.group_id = g.group_id) as technique_count
+        FROM groups g
+        LEFT JOIN group_metadata gm ON g.group_id = gm.group_id
+        WHERE ({sector_conditions})
+        ORDER BY technique_count DESC, g.name
+    """, sector_params)
+
+    total = len(all_groups)
+    offset = (page - 1) * page_size
+    page_groups = all_groups[offset:offset + page_size]
+
+    # Parse target_sectors JSON for each group
+    for g in page_groups:
+        if g.get("target_sectors"):
+            try:
+                g["target_sectors"] = json.loads(g["target_sectors"])
+            except (ValueError, TypeError):
+                pass
+
+    # Get top techniques per group on this page
+    if page_groups:
+        group_ids = [g["group_id"] for g in page_groups]
+        placeholders = ",".join("?" * len(group_ids))
+        tech_rows = query(f"""
+            SELECT g.group_id, t.technique_id, t.name as technique_name,
+                   t.plain_english,
+                   COUNT(DISTINCT ktm.cve_id) as kev_count
+            FROM groups g
+            JOIN group_techniques gt ON g.group_id = gt.group_id
+            JOIN techniques t ON gt.technique_id = t.technique_id
+            LEFT JOIN kev_technique_mappings ktm ON t.technique_id = ktm.technique_id
+            WHERE g.group_id IN ({placeholders})
+              AND t.is_deprecated = 0 AND t.is_revoked = 0
+            GROUP BY g.group_id, t.technique_id
+            ORDER BY g.group_id, kev_count DESC, t.technique_id
+        """, tuple(group_ids))
+
+        # Group techniques by group_id, take top N
+        from collections import defaultdict
+        tech_by_group = defaultdict(list)
+        for row in tech_rows:
+            gid = row["group_id"]
+            if len(tech_by_group[gid]) < top_techniques:
+                tech_by_group[gid].append({
+                    "technique_id": row["technique_id"],
+                    "name": row["technique_name"],
+                    "plain_english": row["plain_english"],
+                    "kev_count": row["kev_count"],
+                })
+
+        for g in page_groups:
+            g["top_techniques"] = tech_by_group.get(g["group_id"], [])
+
+    # Aggregate: top techniques across ALL matching groups
+    all_group_ids = [g["group_id"] for g in all_groups]
+    agg_techniques = []
+    if all_group_ids:
+        placeholders = ",".join("?" * len(all_group_ids))
+        agg_techniques = query(f"""
+            SELECT t.technique_id, t.name, t.plain_english,
+                   COUNT(DISTINCT gt.group_id) as group_count,
+                   COUNT(DISTINCT ktm.cve_id) as kev_count
+            FROM group_techniques gt
+            JOIN techniques t ON gt.technique_id = t.technique_id
+            LEFT JOIN kev_technique_mappings ktm ON t.technique_id = ktm.technique_id
+            WHERE gt.group_id IN ({placeholders})
+              AND t.is_deprecated = 0 AND t.is_revoked = 0
+            GROUP BY t.technique_id
+            ORDER BY group_count DESC, kev_count DESC
+            LIMIT 15
+        """, tuple(all_group_ids))
+
+    # KEV summary: CVEs mapped to techniques used by matching groups
+    kev_summary = []
+    if all_group_ids:
+        placeholders = ",".join("?" * len(all_group_ids))
+        kev_summary = query(f"""
+            SELECT k.cve_id, k.vulnerability_name, k.vendor_project,
+                   k.known_ransomware, k.date_added, k.plain_english,
+                   COUNT(DISTINCT gt.group_id) as group_count,
+                   GROUP_CONCAT(DISTINCT ktm.technique_id) as technique_ids
+            FROM kev_entries k
+            JOIN kev_technique_mappings ktm ON k.cve_id = ktm.cve_id
+            JOIN group_techniques gt ON ktm.technique_id = gt.technique_id
+            WHERE gt.group_id IN ({placeholders})
+            GROUP BY k.cve_id
+            ORDER BY group_count DESC, k.date_added DESC
+            LIMIT 20
+        """, tuple(all_group_ids))
+
+    return {
+        "sectors": sector_list,
+        "total_groups": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": (total + page_size - 1) // page_size,
+        "groups": page_groups,
+        "top_techniques": agg_techniques,
+        "kev_exposure": kev_summary,
+        "summary": {
+            "group_count": total,
+            "technique_count": len(agg_techniques),
+            "kev_count": len(kev_summary),
+            "ransomware_kev_count": sum(1 for k in kev_summary if k.get("known_ransomware") == "Known"),
+        }
+    }
+
+
 @app.get("/search", tags=["search"])
 def search(
     q: str = Query(..., min_length=2),
