@@ -912,7 +912,7 @@ def threat_profile(
 @app.get("/risk-gap", tags=["threat-profile"])
 async def risk_gap(
     sectors: str = Query(..., description="Comma-separated sectors e.g. Healthcare,Government"),
-    days: int = Query(default=90, ge=1, le=365, description="KEV entries added in last N days"),
+    days: int = Query(default=365, ge=1, le=730, description="KEV entries added in last N days (default 365 — CTID mappings lag ~6-12 months behind CISA KEV)"),
     framework: str = Query(default="NIST-800-53", description="Compliance framework to check coverage against"),
 ):
     """
