@@ -909,6 +909,171 @@ def threat_profile(
     }
 
 
+@app.get("/risk-gap", tags=["threat-profile"])
+async def risk_gap(
+    sectors: str = Query(..., description="Comma-separated sectors e.g. Healthcare,Government"),
+    days: int = Query(default=90, ge=1, le=365, description="KEV entries added in last N days"),
+    framework: str = Query(default="NIST-800-53", description="Compliance framework to check coverage against"),
+):
+    """
+    Cross-references actively exploited vulnerabilities (CISA KEV) with threat groups
+    targeting the specified sectors, then checks NIST 800-53 control coverage for each
+    technique — identifying gaps where no mitigating control exists.
+
+    Returns a risk assessment with:
+    - Recent KEV entries mapped to techniques used by sector-targeting groups
+    - For each technique: NIST control coverage classification (covered/partial/none)
+    - Summary: covered, partial, and uncovered technique counts
+    - Top uncovered techniques sorted by KEV exposure
+    """
+    sector_list = [s.strip() for s in sectors.split(",") if s.strip()]
+    if not sector_list:
+        raise HTTPException(status_code=400, detail="At least one sector required")
+
+    # Step 1: Get groups targeting these sectors
+    sector_conditions = " OR ".join(["gm.target_sectors LIKE ?"] * len(sector_list))
+    sector_params = tuple(f"%{s}%" for s in sector_list)
+
+    sector_groups = query(f"""
+        SELECT g.group_id FROM groups g
+        LEFT JOIN group_metadata gm ON g.group_id = gm.group_id
+        WHERE ({sector_conditions})
+    """, sector_params)
+    group_ids = [g["group_id"] for g in sector_groups]
+
+    if not group_ids:
+        return {"sectors": sector_list, "error": "No groups found for specified sectors"}
+
+    # Step 2: Get techniques used by these groups
+    placeholders = ",".join("?" * len(group_ids))
+    group_techniques = query(f"""
+        SELECT DISTINCT gt.technique_id,
+               COUNT(DISTINCT gt.group_id) as group_count
+        FROM group_techniques gt
+        WHERE gt.group_id IN ({placeholders})
+        GROUP BY gt.technique_id
+    """, tuple(group_ids))
+    sector_technique_ids = {r["technique_id"]: r["group_count"] for r in group_techniques}
+
+    # Step 3: Get recent KEV entries and their technique mappings
+    recent_kev = query("""
+        SELECT k.cve_id, k.vulnerability_name, k.vendor_project,
+               k.known_ransomware, k.date_added, k.plain_english,
+               ktm.technique_id
+        FROM kev_entries k
+        JOIN kev_technique_mappings ktm ON k.cve_id = ktm.cve_id
+        WHERE k.date_added >= date('now', ?)
+    """, (f"-{days} days",))
+
+    # Step 4: Filter KEV entries to those with techniques used by sector groups
+    # Build: technique_id -> {kev entries}
+    from collections import defaultdict
+    technique_kev = defaultdict(list)
+    all_relevant_kev = {}
+
+    for row in recent_kev:
+        tid = row["technique_id"]
+        if tid in sector_technique_ids:
+            technique_kev[tid].append({
+                "cve_id": row["cve_id"],
+                "vulnerability_name": row["vulnerability_name"],
+                "vendor_project": row["vendor_project"],
+                "known_ransomware": row["known_ransomware"],
+                "date_added": row["date_added"],
+                "plain_english": row["plain_english"],
+            })
+            all_relevant_kev[row["cve_id"]] = row["vulnerability_name"]
+
+    # Get technique details for all relevant techniques with KEV
+    relevant_technique_ids = list(technique_kev.keys())
+    technique_details = {}
+    if relevant_technique_ids:
+        ph = ",".join("?" * len(relevant_technique_ids))
+        rows = query(f"""
+            SELECT technique_id, name, plain_english
+            FROM techniques
+            WHERE technique_id IN ({ph})
+        """, tuple(relevant_technique_ids))
+        for r in rows:
+            technique_details[r["technique_id"]] = r
+
+    # Step 5: Check compliance coverage for each relevant technique
+    covered = []
+    partial = []
+    uncovered = []
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for tid in relevant_technique_ids:
+            tech = technique_details.get(tid, {})
+            kev_list = technique_kev[tid]
+            group_count = sector_technique_ids.get(tid, 0)
+            ransomware_kev = sum(1 for k in kev_list if k.get("known_ransomware") == "Known")
+
+            entry = {
+                "technique_id": tid,
+                "technique_name": tech.get("name", tid),
+                "plain_english": tech.get("plain_english"),
+                "group_count": group_count,
+                "kev_count": len(kev_list),
+                "ransomware_kev_count": ransomware_kev,
+                "recent_kev": kev_list[:5],
+                "nist_control_count": 0,
+                "nist_controls": [],
+                "coverage": "none",
+            }
+
+            try:
+                resp = await client.get(
+                    f"{COMPLIANCE_API_URL}/attack/techniques/{tid}"
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    control_count = data.get("nist_control_count", 0)
+                    entry["nist_control_count"] = control_count
+                    entry["nist_controls"] = data.get("nist_controls", [])[:5]
+                    if control_count >= 3:
+                        entry["coverage"] = "covered"
+                        covered.append(entry)
+                    elif control_count > 0:
+                        entry["coverage"] = "partial"
+                        partial.append(entry)
+                    else:
+                        entry["coverage"] = "none"
+                        uncovered.append(entry)
+                else:
+                    uncovered.append(entry)
+            except httpx.RequestError:
+                entry["coverage"] = "unknown"
+                uncovered.append(entry)
+
+    # Sort each bucket by KEV count descending
+    for bucket in [covered, partial, uncovered]:
+        bucket.sort(key=lambda x: (x["kev_count"], x["group_count"]), reverse=True)
+
+    return {
+        "sectors": sector_list,
+        "framework": framework,
+        "days": days,
+        "summary": {
+            "total_sector_groups": len(group_ids),
+            "relevant_kev_count": len(all_relevant_kev),
+            "relevant_technique_count": len(relevant_technique_ids),
+            "covered_count": len(covered),
+            "partial_count": len(partial),
+            "uncovered_count": len(uncovered),
+            "ransomware_kev_count": sum(
+                1 for k in all_relevant_kev
+                if any(e.get("known_ransomware") == "Known"
+                       for t in technique_kev.values() for e in t
+                       if e["cve_id"] == k)
+            ),
+        },
+        "uncovered": uncovered,
+        "partial": partial,
+        "covered": covered,
+    }
+
+
 @app.get("/search", tags=["search"])
 def search(
     q: str = Query(..., min_length=2),
