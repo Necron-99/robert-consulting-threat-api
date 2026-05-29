@@ -486,6 +486,7 @@ def list_groups(
     country: Optional[str] = Query(default=None, description="ISO 3166-1 alpha-2 e.g. RU, CN"),
     motivation: Optional[str] = Query(default=None, description="espionage, financial, destruction, hacktivism"),
     sponsor_type: Optional[str] = Query(default=None, description="nation-state, criminal, hacktivist, unknown"),
+    sectors: Optional[str] = Query(default=None, description="Comma-separated sectors e.g. Healthcare,Government"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=100, ge=1, le=500),
 ):
@@ -502,6 +503,16 @@ def list_groups(
     if sponsor_type:
         where.append("gm.sponsor_type = ?")
         params.append(sponsor_type.lower())
+    if sectors:
+        sector_list = [s.strip() for s in sectors.split(",") if s.strip()]
+        if sector_list:
+            # Match groups where target_sectors JSON contains any of the requested sectors
+            sector_conditions = " OR ".join(
+                ["gm.target_sectors LIKE ?"] * len(sector_list)
+            )
+            where.append(f"({sector_conditions})")
+            for s in sector_list:
+                params.append(f"%{s}%")
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
@@ -513,9 +524,11 @@ def list_groups(
     results = query(
         f"""SELECT g.group_id, g.name, g.aliases,
                    gm.country, gm.country_name, gm.motivation,
-                   gm.sponsor_type, gm.first_seen, gm.target_sectors
+                   gm.sponsor_type, gm.first_seen, gm.target_sectors,
+                   (SELECT COUNT(*) FROM group_techniques gt
+                    WHERE gt.group_id = g.group_id) as technique_count
             FROM groups g {joins} {where_sql}
-            ORDER BY g.name LIMIT ? OFFSET ?""",
+            ORDER BY technique_count DESC, g.name LIMIT ? OFFSET ?""",
         tuple(params) + (page_size, offset)
     )
 
