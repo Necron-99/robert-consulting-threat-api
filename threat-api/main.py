@@ -997,13 +997,47 @@ async def risk_gap(
         for r in rows:
             technique_details[r["technique_id"]] = r
 
-    # Step 5: Check compliance coverage — parallel httpx calls
+    # Step 5: Check compliance coverage
+    # Fast path: query local compliance.db if mounted
+    # Slow path: parallel httpx calls to compliance API
     covered = []
     partial = []
     uncovered = []
     compliance_coverage = {}
 
-    if relevant_technique_ids:
+    comp_db_path = os.getenv("COMPLIANCE_DATABASE_PATH", "")
+    if relevant_technique_ids and comp_db_path and os.path.exists(comp_db_path):
+        # Fast path — local DB query, <10ms
+        try:
+            import sqlite3 as _sqlite3
+            comp_conn = _sqlite3.connect(
+                f"file:{comp_db_path}?mode=ro&immutable=1", uri=True
+            )
+            comp_conn.row_factory = _sqlite3.Row
+            ph = ",".join("?" * len(relevant_technique_ids))
+            rows = comp_conn.execute(f"""
+                SELECT technique_id,
+                       COUNT(DISTINCT nist_control_id) as control_count,
+                       GROUP_CONCAT(DISTINCT nist_control_id) as control_ids
+                FROM attack_technique_mappings
+                WHERE technique_id IN ({ph})
+                  AND nist_control_id != 'NONE'
+                GROUP BY technique_id
+            """, tuple(relevant_technique_ids)).fetchall()
+            for r in rows:
+                compliance_coverage[r["technique_id"]] = {
+                    "control_count": r["control_count"],
+                    "controls": [{"nist_control_id": c}
+                                 for c in (r["control_ids"] or "").split(",")[:5]]
+                }
+            comp_conn.close()
+            log.info(f"risk-gap: used local compliance DB for {len(relevant_technique_ids)} techniques")
+        except Exception as e:
+            log.warning(f"risk-gap: local DB failed ({e}), falling back to API")
+            comp_db_path = ""
+
+    if relevant_technique_ids and not comp_db_path:
+        # Slow path — parallel httpx calls
         async with httpx.AsyncClient(timeout=15.0) as client:
             async def fetch_coverage(tid):
                 try:
