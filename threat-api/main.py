@@ -800,11 +800,12 @@ def threat_profile(
                gm.country, gm.country_name, gm.motivation,
                gm.sponsor_type, gm.first_seen, gm.target_sectors,
                g.threat_narrative,
-               (SELECT COUNT(*) FROM group_techniques gt
-                WHERE gt.group_id = g.group_id) as technique_count
+               COUNT(DISTINCT gt.technique_id) as technique_count
         FROM groups g
         LEFT JOIN group_metadata gm ON g.group_id = gm.group_id
+        LEFT JOIN group_techniques gt ON g.group_id = gt.group_id
         WHERE ({sector_conditions})
+        GROUP BY g.group_id
         ORDER BY technique_count DESC, g.name
     """, sector_params)
 
@@ -858,7 +859,6 @@ def threat_profile(
     all_group_ids = [g["group_id"] for g in all_groups]
     agg_techniques = []
     if all_group_ids:
-        placeholders = ",".join("?" * len(all_group_ids))
         agg_techniques = query(f"""
             SELECT t.technique_id, t.name, t.plain_english,
                    COUNT(DISTINCT gt.group_id) as group_count,
@@ -866,7 +866,9 @@ def threat_profile(
             FROM group_techniques gt
             JOIN techniques t ON gt.technique_id = t.technique_id
             LEFT JOIN kev_technique_mappings ktm ON t.technique_id = ktm.technique_id
-            WHERE gt.group_id IN ({placeholders})
+            JOIN groups g ON gt.group_id = g.group_id
+            LEFT JOIN group_metadata gm ON g.group_id = gm.group_id
+            WHERE ({sector_conditions})
               AND t.is_deprecated = 0 AND t.is_revoked = 0
             GROUP BY t.technique_id
             ORDER BY group_count DESC, kev_count DESC
@@ -876,7 +878,6 @@ def threat_profile(
     # KEV summary: CVEs mapped to techniques used by matching groups
     kev_summary = []
     if all_group_ids:
-        placeholders = ",".join("?" * len(all_group_ids))
         kev_summary = query(f"""
             SELECT k.cve_id, k.vulnerability_name, k.vendor_project,
                    k.known_ransomware, k.date_added, k.plain_english,
@@ -885,11 +886,13 @@ def threat_profile(
             FROM kev_entries k
             JOIN kev_technique_mappings ktm ON k.cve_id = ktm.cve_id
             JOIN group_techniques gt ON ktm.technique_id = gt.technique_id
-            WHERE gt.group_id IN ({placeholders})
+            JOIN groups g ON gt.group_id = g.group_id
+            LEFT JOIN group_metadata gm ON g.group_id = gm.group_id
+            WHERE ({sector_conditions})
             GROUP BY k.cve_id
             ORDER BY group_count DESC, k.date_added DESC
             LIMIT 20
-        """, tuple(all_group_ids))
+        """, sector_params)
 
     return {
         "sectors": sector_list,
