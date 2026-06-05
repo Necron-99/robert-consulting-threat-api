@@ -997,54 +997,65 @@ async def risk_gap(
         for r in rows:
             technique_details[r["technique_id"]] = r
 
-    # Step 5: Check compliance coverage for each relevant technique
+    # Step 5: Check compliance coverage — parallel httpx calls
     covered = []
     partial = []
     uncovered = []
+    compliance_coverage = {}
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for tid in relevant_technique_ids:
-            tech = technique_details.get(tid, {})
-            kev_list = technique_kev[tid]
-            group_count = sector_technique_ids.get(tid, 0)
-            ransomware_kev = sum(1 for k in kev_list if k.get("known_ransomware") == "Known")
+    if relevant_technique_ids:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            async def fetch_coverage(tid):
+                try:
+                    resp = await client.get(
+                        f"{COMPLIANCE_API_URL}/attack/techniques/{tid}"
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        return tid, {
+                            "control_count": data.get("nist_control_count", 0),
+                            "controls": data.get("nist_controls", [])[:5]
+                        }
+                except httpx.RequestError:
+                    pass
+                return tid, {"control_count": 0, "controls": []}
 
-            entry = {
-                "technique_id": tid,
-                "technique_name": tech.get("name", tid),
-                "plain_english": tech.get("plain_english"),
-                "group_count": group_count,
-                "kev_count": len(kev_list),
-                "ransomware_kev_count": ransomware_kev,
-                "recent_kev": kev_list[:5],
-                "nist_control_count": 0,
-                "nist_controls": [],
-                "coverage": "none",
-            }
+            import asyncio
+            results = await asyncio.gather(
+                *[fetch_coverage(tid) for tid in relevant_technique_ids]
+            )
+            compliance_coverage = dict(results)
 
-            try:
-                resp = await client.get(
-                    f"{COMPLIANCE_API_URL}/attack/techniques/{tid}"
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    control_count = data.get("nist_control_count", 0)
-                    entry["nist_control_count"] = control_count
-                    entry["nist_controls"] = data.get("nist_controls", [])[:5]
-                    if control_count >= 3:
-                        entry["coverage"] = "covered"
-                        covered.append(entry)
-                    elif control_count > 0:
-                        entry["coverage"] = "partial"
-                        partial.append(entry)
-                    else:
-                        entry["coverage"] = "none"
-                        uncovered.append(entry)
-                else:
-                    uncovered.append(entry)
-            except httpx.RequestError:
-                entry["coverage"] = "unknown"
-                uncovered.append(entry)
+    for tid in relevant_technique_ids:
+        tech = technique_details.get(tid, {})
+        kev_list = technique_kev[tid]
+        group_count = sector_technique_ids.get(tid, 0)
+        ransomware_kev = sum(1 for k in kev_list if k.get("known_ransomware") == "Known")
+        cov = compliance_coverage.get(tid, {"control_count": 0, "controls": []})
+        control_count = cov["control_count"]
+
+        entry = {
+            "technique_id": tid,
+            "technique_name": tech.get("name", tid),
+            "plain_english": tech.get("plain_english"),
+            "group_count": group_count,
+            "kev_count": len(kev_list),
+            "ransomware_kev_count": ransomware_kev,
+            "recent_kev": kev_list[:5],
+            "nist_control_count": control_count,
+            "nist_controls": cov["controls"],
+            "coverage": "none",
+        }
+
+        if control_count >= 3:
+            entry["coverage"] = "covered"
+            covered.append(entry)
+        elif control_count > 0:
+            entry["coverage"] = "partial"
+            partial.append(entry)
+        else:
+            entry["coverage"] = "none"
+            uncovered.append(entry)
 
     # Sort each bucket by KEV count descending
     for bucket in [covered, partial, uncovered]:
