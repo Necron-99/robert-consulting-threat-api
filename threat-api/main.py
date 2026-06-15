@@ -37,6 +37,8 @@ Endpoints:
     GET /kev/stats                       — KEV summary statistics
 
     GET /search                          — search across techniques, groups, software
+
+    GET /techniques/{technique_id}/summary — AI threat briefing via Ollama (llama3.2:3b)
 """
 
 import json
@@ -1248,3 +1250,180 @@ def search(
 
     total = sum(len(v) for v in results.values())
     return {"query": q, "total_results": total, **results}
+
+# =============================================================================
+# AI Threat Summary — powered by Ollama (internal)
+# =============================================================================
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama.ollama.svc.cluster.local:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+
+
+@app.get("/techniques/{technique_id}/summary", tags=["ai"])
+async def get_technique_summary(
+    technique_id: str,
+    sector: Optional[str] = Query(
+        default=None,
+        description="Optional sector context e.g. Healthcare, Government"
+    ),
+):
+    """
+    Generate an AI-powered threat intelligence briefing for a technique.
+
+    Uses llama3.2:3b running locally via Ollama — grounded in the actual
+    ATT&CK data, KEV catalog, and compliance mappings from this platform.
+    No data leaves the cluster.
+    """
+    tid = technique_id.upper()
+
+    # -------------------------------------------------------------------------
+    # 1. Gather all context from the database
+    # -------------------------------------------------------------------------
+    tech = query_one(
+        "SELECT * FROM techniques WHERE technique_id = ?", (tid,)
+    )
+    if not tech:
+        raise HTTPException(status_code=404, detail=f"Technique '{tid}' not found")
+
+    tactics = query("""
+        SELECT t.tactic_id, t.name FROM tactics t
+        JOIN technique_tactics tt ON t.tactic_id = tt.tactic_id
+        WHERE tt.technique_id = ?
+    """, (tid,))
+
+    groups = query("""
+        SELECT g.group_id, g.name, gm.country_name, gm.motivation,
+               gm.sponsor_type, gm.target_sectors, gt.use_description
+        FROM groups g
+        JOIN group_techniques gt ON g.group_id = gt.group_id
+        LEFT JOIN group_metadata gm ON g.group_id = gm.group_id
+        WHERE gt.technique_id = ?
+        ORDER BY g.name
+        LIMIT 10
+    """, (tid,))
+
+    kev_entries = query("""
+        SELECT k.cve_id, k.vendor_project, k.product,
+               k.vulnerability_name, k.date_added, k.known_ransomware
+        FROM kev_entries k
+        JOIN kev_technique_mappings ktm ON k.cve_id = ktm.cve_id
+        WHERE ktm.technique_id = ?
+        ORDER BY k.date_added DESC
+        LIMIT 5
+    """, (tid,))
+
+    # Compliance coverage from local DB
+    nist_controls = []
+    comp_db_path = os.getenv("COMPLIANCE_DATABASE_PATH", "")
+    if comp_db_path and os.path.exists(comp_db_path):
+        try:
+            import sqlite3 as _sqlite3
+            conn = _sqlite3.connect(
+                f"file:{comp_db_path}?mode=ro&immutable=1", uri=True
+            )
+            conn.row_factory = _sqlite3.Row
+            rows = conn.execute("""
+                SELECT nist_control_id, control_name
+                FROM attack_technique_mappings atm
+                JOIN nist_controls nc ON atm.nist_control_id = nc.control_id
+                WHERE technique_id = ? AND nist_control_id != 'NONE'
+                LIMIT 8
+            """, (tid,)).fetchall()
+            nist_controls = [dict(r) for r in rows]
+            conn.close()
+        except Exception as e:
+            log.warning(f"summary: compliance DB error: {e}")
+
+    # -------------------------------------------------------------------------
+    # 2. Build grounded prompt
+    # -------------------------------------------------------------------------
+    tactic_names = ", ".join(t["name"] for t in tactics)
+    group_lines = "\n".join(
+        f"- {g['name']} ({g.get('country_name', 'Unknown origin')}, "
+        f"{g.get('motivation', 'unknown motivation')})"
+        for g in groups[:6]
+    )
+    kev_lines = "\n".join(
+        f"- {k['cve_id']}: {k['vulnerability_name']} ({k['vendor_project']}) "
+        f"{'[RANSOMWARE]' if k.get('known_ransomware') == 'Known' else ''}"
+        for k in kev_entries
+    )
+    control_lines = "\n".join(
+        f"- {c['nist_control_id']}: {c.get('control_name', '')}"
+        for c in nist_controls[:6]
+    ) or "No NIST 800-53 controls mapped to this technique."
+
+    sector_context = f"\nThe organization operates in the {sector} sector." if sector else ""
+
+    prompt = f"""You are a senior threat intelligence analyst. Write a concise, actionable threat briefing for a security team.
+
+TECHNIQUE: {tid} — {tech['name']}
+TACTICS: {tactic_names}
+DESCRIPTION: {tech.get('description', 'No description available.')[:800]}
+{sector_context}
+
+THREAT ACTORS KNOWN TO USE THIS TECHNIQUE ({len(groups)} total):
+{group_lines if group_lines else 'No attributed groups in database.'}
+
+ACTIVELY EXPLOITED CVEs (CISA KEV) LINKED TO THIS TECHNIQUE:
+{kev_lines if kev_lines else 'No KEV entries mapped to this technique.'}
+
+NIST 800-53 MITIGATING CONTROLS:
+{control_lines}
+
+Write a threat briefing with these sections:
+1. WHAT IS THIS (1-2 sentences, plain English)
+2. WHY IT MATTERS (real-world impact, who uses it and why)
+3. DETECTION FOCUS (what to look for)
+4. PRIORITY ACTIONS (2-3 specific defensive steps)
+
+Be direct and specific. Avoid generic security advice. Ground everything in the data above."""
+
+    # -------------------------------------------------------------------------
+    # 3. Call Ollama
+    # -------------------------------------------------------------------------
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.3,
+                        "num_predict": 600,
+                    }
+                }
+            )
+            resp.raise_for_status()
+            ollama_data = resp.json()
+            summary = ollama_data.get("response", "").strip()
+            duration_ms = round(ollama_data.get("total_duration", 0) / 1_000_000)
+
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Ollama unavailable: {e}. Is Ollama running at {OLLAMA_URL}?"
+        )
+
+    # -------------------------------------------------------------------------
+    # 4. Return summary + raw context
+    # -------------------------------------------------------------------------
+    return {
+        "technique_id": tid,
+        "technique_name": tech["name"],
+        "sector_context": sector,
+        "ai_summary": summary,
+        "model": OLLAMA_MODEL,
+        "duration_ms": duration_ms,
+        "context": {
+            "tactics": [t["name"] for t in tactics],
+            "group_count": len(groups),
+            "kev_count": len(kev_entries),
+            "nist_control_count": len(nist_controls),
+            "groups": groups[:6],
+            "kev_entries": kev_entries,
+            "nist_controls": nist_controls,
+        }
+    }
