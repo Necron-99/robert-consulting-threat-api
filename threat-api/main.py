@@ -1377,43 +1377,15 @@ Write a threat briefing with these sections:
 Be direct and specific. Avoid generic security advice. Ground everything in the data above."""
 
     # -------------------------------------------------------------------------
-    # 3. Call Ollama
+    # 3. Call Ollama — streaming response
     # -------------------------------------------------------------------------
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.3,
-                        "num_predict": 600,
-                    }
-                }
-            )
-            resp.raise_for_status()
-            ollama_data = resp.json()
-            summary = ollama_data.get("response", "").strip()
-            duration_ms = round(ollama_data.get("total_duration", 0) / 1_000_000)
+    import json as _json
 
-    except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Ollama unavailable: {e}. Is Ollama running at {OLLAMA_URL}?"
-        )
-
-    # -------------------------------------------------------------------------
-    # 4. Return summary + raw context
-    # -------------------------------------------------------------------------
-    return {
+    context_data = {
         "technique_id": tid,
         "technique_name": tech["name"],
         "sector_context": sector,
-        "ai_summary": summary,
         "model": OLLAMA_MODEL,
-        "duration_ms": duration_ms,
         "context": {
             "tactics": [t["name"] for t in tactics],
             "group_count": len(groups),
@@ -1424,3 +1396,58 @@ Be direct and specific. Avoid generic security advice. Ground everything in the 
             "nist_controls": nist_controls,
         }
     }
+
+    async def stream_summary():
+        # First yield context metadata as a JSON header line
+        yield _json.dumps({"type": "context", **context_data}) + "\n"
+
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                async with client.stream(
+                    "POST",
+                    f"{OLLAMA_URL}/api/generate",
+                    json={
+                        "model": OLLAMA_MODEL,
+                        "prompt": prompt,
+                        "stream": True,
+                        "options": {
+                            "temperature": 0.3,
+                            "num_predict": 500,
+                        }
+                    }
+                ) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if line.strip():
+                            try:
+                                chunk = _json.loads(line)
+                                token = chunk.get("response", "")
+                                done = chunk.get("done", False)
+                                if token:
+                                    yield _json.dumps({"type": "token", "text": token}) + "\n"
+                                if done:
+                                    duration_ms = round(
+                                        chunk.get("total_duration", 0) / 1_000_000
+                                    )
+                                    yield _json.dumps({
+                                        "type": "done",
+                                        "duration_ms": duration_ms
+                                    }) + "\n"
+                            except _json.JSONDecodeError:
+                                pass
+        except httpx.RequestError as e:
+            yield _json.dumps({
+                "type": "error",
+                "detail": f"Ollama unavailable: {e}"
+            }) + "\n"
+
+    from fastapi.responses import StreamingResponse as _StreamingResponse
+    return _StreamingResponse(
+        stream_summary(),
+        media_type="application/x-ndjson",
+        headers={
+            "X-Technique-ID": tid,
+            "X-Technique-Name": tech["name"],
+            "Cache-Control": "no-cache",
+        }
+    )
