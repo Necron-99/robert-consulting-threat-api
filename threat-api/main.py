@@ -1264,6 +1264,10 @@ async def get_technique_summary(
         default=None,
         description="Optional sector context e.g. Healthcare, Government"
     ),
+    model: Optional[str] = Query(
+        default=None,
+        description="Ollama model to use e.g. llama3.2:1b, llama3.2:3b (default: server default)"
+    ),
 ):
     """
     Generate an AI-powered threat intelligence briefing for a technique.
@@ -1381,11 +1385,12 @@ Be direct and specific. Avoid generic security advice. Ground everything in the 
     # -------------------------------------------------------------------------
     import json as _json
 
+    active_model = model or OLLAMA_MODEL
     context_data = {
         "technique_id": tid,
         "technique_name": tech["name"],
         "sector_context": sector,
-        "model": OLLAMA_MODEL,
+        "model": active_model,
         "context": {
             "tactics": [t["name"] for t in tactics],
             "group_count": len(groups),
@@ -1407,7 +1412,7 @@ Be direct and specific. Avoid generic security advice. Ground everything in the 
                     "POST",
                     f"{OLLAMA_URL}/api/generate",
                     json={
-                        "model": OLLAMA_MODEL,
+                        "model": model or OLLAMA_MODEL,
                         "prompt": prompt,
                         "stream": True,
                         "options": {
