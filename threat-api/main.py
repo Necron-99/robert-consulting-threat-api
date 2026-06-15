@@ -37,8 +37,6 @@ Endpoints:
     GET /kev/stats                       — KEV summary statistics
 
     GET /search                          — search across techniques, groups, software
-
-    GET /techniques/{technique_id}/summary — AI threat briefing via Ollama (llama3.2:3b)
 """
 
 import json
@@ -1323,9 +1321,8 @@ async def get_technique_summary(
             )
             conn.row_factory = _sqlite3.Row
             rows = conn.execute("""
-                SELECT nist_control_id, control_name
-                FROM attack_technique_mappings atm
-                JOIN nist_controls nc ON atm.nist_control_id = nc.control_id
+                SELECT nist_control_id, mapping_type, comments
+                FROM attack_technique_mappings
                 WHERE technique_id = ? AND nist_control_id != 'NONE'
                 LIMIT 8
             """, (tid,)).fetchall()
@@ -1349,7 +1346,7 @@ async def get_technique_summary(
         for k in kev_entries
     )
     control_lines = "\n".join(
-        f"- {c['nist_control_id']}: {c.get('control_name', '')}"
+        f"- {c['nist_control_id']}: {c.get('comments', c.get('mapping_type', ''))[:120]}"
         for c in nist_controls[:6]
     ) or "No NIST 800-53 controls mapped to this technique."
 
