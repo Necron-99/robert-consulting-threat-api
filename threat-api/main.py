@@ -1346,7 +1346,7 @@ async def get_technique_summary(
         for k in kev_entries
     )
     control_lines = "\n".join(
-        f"- {c['nist_control_id']}: {c.get('comments', c.get('mapping_type', ''))[:120]}"
+        f"- {c['nist_control_id']}: {(c.get('comments') or c.get('mapping_type') or '')[:120]}"
         for c in nist_controls[:6]
     ) or "No NIST 800-53 controls mapped to this technique."
 
